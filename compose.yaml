@@ -1,0 +1,254 @@
+# The whole Panelarr stack on one machine. See README.md for the first run.
+#
+#   ./generate-secrets.sh          # once: .env and secrets/
+#   docker compose up -d --build   # the core stack
+#
+# Optional parts are profiles:
+#   --profile search-typesense     Typesense for meta's search (META_SEARCH_BACKEND=typesense)
+#   --profile search-meilisearch   Meilisearch for meta's search (META_SEARCH_BACKEND=meilisearch)
+#   --profile solver               FlareSolverr, for sites behind anti-bot challenges
+#   --profile vpn                  gluetun: a VPN connection offered as an HTTP proxy
+#
+# Images are built from the local checkouts next to this folder (../meta,
+# ../meta-mangabaka, ../mihon-source, ../source-mihon, ../source-api,
+# ../server) until they are published. The server image embeds the web app
+# from ../web/dist: build it first (README.md, step 2).
+#
+# Ports are published on 127.0.0.1 only. To reach the app from other devices,
+# set APP_BIND=0.0.0.0 in .env (and put TLS in front for anything beyond your
+# LAN). Admin ports (meta 8901, mihon-source 8902) are meant to stay local.
+name: panelarr
+
+x-hardened: &hardened
+  read_only: true
+  tmpfs:
+    - /tmp:rw,size=64m
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+
+services:
+  # ---------------------------------------------------------------------------
+  # Database: one server, a database and a role per service.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run ./generate-secrets.sh}
+      # Read by postgres/10-databases.sh on the first start.
+      META_DB_PASSWORD: ${META_DB_PASSWORD:?run ./generate-secrets.sh}
+      PANELARR_DB_PASSWORD: ${PANELARR_DB_PASSWORD:?run ./generate-secrets.sh}
+    volumes:
+      - postgres:/var/lib/postgresql
+      - ./postgres/10-databases.sh:/docker-entrypoint-initdb.d/10-databases.sh:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    # No published port: only the services on this network reach it.
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Metadata: meta and its MangaBaka plugin.
+  # ---------------------------------------------------------------------------
+  meta:
+    <<: *hardened
+    image: panelarr/meta:${META_TAG:-dev}
+    build:
+      context: ../meta
+    depends_on:
+      postgres:
+        condition: service_healthy
+      meta-mangabaka:
+        condition: service_started
+    environment:
+      META_CONFIG: /etc/meta/meta.yaml
+      META_DATABASE_URL: postgres://meta:${META_DB_PASSWORD}@postgres:5432/meta?sslmode=disable
+      META_ADMIN_TOKEN: ${META_ADMIN_TOKEN:?run ./generate-secrets.sh}
+      META_SECRET_KEY: ${META_SECRET_KEY:?run ./generate-secrets.sh}
+      MANGABAKA_PLUGIN_KEY: ${MANGABAKA_PLUGIN_KEY:?run ./generate-secrets.sh}
+      # postgres (default), typesense or meilisearch; meta's admin can change it.
+      META_SEARCH_BACKEND: ${META_SEARCH_BACKEND:-postgres}
+      META_TYPESENSE_URL: http://typesense:8108
+      META_TYPESENSE_API_KEY: ${TYPESENSE_API_KEY:-}
+      META_MEILISEARCH_URL: http://meilisearch:7700
+      META_MEILISEARCH_API_KEY: ${MEILI_MASTER_KEY:-}
+    volumes:
+      - ./meta/meta.yaml:/etc/meta/meta.yaml:ro
+      - meta:/data
+    ports:
+      - "${ADMIN_BIND:-127.0.0.1}:${META_PORT:-8901}:8901"   # meta's API and admin UI
+
+  meta-mangabaka:
+    <<: *hardened
+    image: panelarr/meta-mangabaka:${MANGABAKA_TAG:-dev}
+    build:
+      context: ../meta-mangabaka
+      additional_contexts:
+        meta: ../meta
+    environment:
+      PLUGIN_API_KEY: ${MANGABAKA_PLUGIN_KEY}
+    volumes:
+      # The downloaded dump lives here (about 4 GB with the default variant).
+      - mangabaka:/data
+    # No published port: only meta talks to the plugin.
+
+  typesense:
+    profiles: [search-typesense]
+    image: typesense/typesense:30.2
+    command: ["--data-dir", "/data", "--api-key", "${TYPESENSE_API_KEY:-}", "--enable-cors=false"]
+    volumes:
+      # The index lives in RAM; this keeps it across restarts.
+      - typesense:/data
+    restart: unless-stopped
+
+  meilisearch:
+    profiles: [search-meilisearch]
+    # The MIT edition: no Enterprise features are used.
+    image: getmeili/meilisearch:v1.54
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-}
+      MEILI_ENV: production
+      MEILI_NO_ANALYTICS: "true"
+    volumes:
+      - meilisearch:/meili_data
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Sources: mihon-source runs Mihon extensions; source-mihon is the Panelarr
+  # source plugin in front of it.
+  # ---------------------------------------------------------------------------
+  mihon-source:
+    <<: *hardened
+    # Extensions' HTTP clients unpack native libraries (zstd, brotli) to /tmp
+    # and load them from there, so /tmp must allow exec here. Everything else
+    # stays read-only, as in the other services.
+    tmpfs:
+      - /tmp:rw,exec,size=128m
+    image: panelarr/mihon-source:${MIHON_TAG:-dev}
+    build:
+      context: ../mihon-source
+    environment:
+      MIHON_ADMIN_TOKEN_FILE: /run/secrets/mihon_admin_token
+      MIHON_SECRET_KEY_FILE: /run/secrets/mihon_secret_key
+      MIHON_LOG_FORMAT: json
+    secrets:
+      - mihon_admin_token
+      - mihon_secret_key
+    volumes:
+      - mihon-data:/data
+    mem_limit: 1g
+    pids_limit: 512
+    ports:
+      - "${ADMIN_BIND:-127.0.0.1}:${MIHON_PORT:-8902}:8902"   # mihon-source's admin UI
+
+  source-mihon:
+    <<: *hardened
+    image: panelarr/source-mihon:${SOURCE_MIHON_TAG:-dev}
+    build:
+      context: ../source-mihon
+      additional_contexts:
+        source-api: ../source-api
+    environment:
+      MIHON_SOURCE_URL: http://mihon-source:8902
+      # A client key created in mihon-source's admin: see README.md, step 4.
+      MIHON_SOURCE_API_KEY_FILE: /run/secrets/mihon_source_api_key
+      PLUGIN_API_KEY_FILE: /run/secrets/source_mihon_api_key
+    secrets:
+      - mihon_source_api_key
+      - source_mihon_api_key
+    depends_on:
+      mihon-source:
+        condition: service_healthy
+    # No published port: only the server reaches http://source-mihon:8904.
+
+  # ---------------------------------------------------------------------------
+  # The Panelarr server and its web app.
+  # ---------------------------------------------------------------------------
+  server:
+    <<: *hardened
+    image: panelarr/server:${SERVER_TAG:-dev}
+    build:
+      context: ../server
+      additional_contexts:
+        meta: ../meta
+        source-api: ../source-api
+        # The web app the server serves. Without it, a placeholder page.
+        web: ${WEB_DIST:-../web/dist}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PANELARR_DB: postgres://panelarr:${PANELARR_DB_PASSWORD}@postgres:5432/panelarr?sslmode=disable
+      PANELARR_SECRET_KEY: ${PANELARR_SECRET_KEY:?run ./generate-secrets.sh}
+      PANELARR_LOG_FORMAT: json
+      PANELARR_BASE_URL: ${PANELARR_BASE_URL:-}
+      # Leave both empty to connect meta in the first-run wizard instead
+      # (README.md, step 6). The key is a meta client key with the admin scope.
+      PANELARR_META_URL: ${PANELARR_META_URL:-}
+      PANELARR_META_KEY: ${PANELARR_META_KEY:-}
+    volumes:
+      - panelarr-config:/config
+      # The library. To keep it on the host instead, use e.g. /srv/panelarr/library:/data.
+      - panelarr-data:/data
+    ports:
+      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-8900}:8900"   # Panelarr: the app and its API
+
+  # ---------------------------------------------------------------------------
+  # Optional helpers for sources and providers behind anti-bot pages or
+  # geo-blocks. Configure them in meta's and mihon-source's admin
+  # (Integrations): solver http://flaresolverr:8191, proxy http://gluetun:8888.
+  # ---------------------------------------------------------------------------
+  flaresolverr:
+    profiles: [solver]
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    environment:
+      LOG_LEVEL: info
+    restart: unless-stopped
+    # No published port: only meta and mihon-source use it.
+
+  gluetun:
+    profiles: [vpn]
+    image: qmcgaw/gluetun:v3
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      # Your VPN provider's settings: see README.md and
+      # https://github.com/qdm12/gluetun-wiki for your provider.
+      VPN_SERVICE_PROVIDER: ${VPN_SERVICE_PROVIDER:-}
+      VPN_TYPE: ${VPN_TYPE:-wireguard}
+      WIREGUARD_PRIVATE_KEY: ${WIREGUARD_PRIVATE_KEY:-}
+      WIREGUARD_ADDRESSES: ${WIREGUARD_ADDRESSES:-}
+      OPENVPN_USER: ${OPENVPN_USER:-}
+      OPENVPN_PASSWORD: ${OPENVPN_PASSWORD:-}
+      SERVER_COUNTRIES: ${VPN_SERVER_COUNTRIES:-}
+      # Offer the tunnel as an HTTP proxy on gluetun:8888, inside this network only.
+      HTTPPROXY: "on"
+      HTTPPROXY_STEALTH: "on"
+      HTTPPROXY_USER: ${GLUETUN_PROXY_USER:-}
+      HTTPPROXY_PASSWORD: ${GLUETUN_PROXY_PASSWORD:-}
+    restart: unless-stopped
+
+secrets:
+  mihon_admin_token:
+    file: ./secrets/mihon_admin_token.txt
+  mihon_secret_key:
+    file: ./secrets/mihon_secret_key.txt
+  mihon_source_api_key:
+    file: ./secrets/mihon_source_api_key.txt
+  source_mihon_api_key:
+    file: ./secrets/source_mihon_api_key.txt
+
+volumes:
+  postgres: {}
+  meta: {}
+  mangabaka: {}
+  typesense: {}
+  meilisearch: {}
+  mihon-data: {}
+  panelarr-config: {}
+  panelarr-data: {}
