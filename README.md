@@ -91,6 +91,27 @@ Several profiles combine: `docker compose --profile solver --profile vpn up -d`.
 
 Set `APP_BIND=0.0.0.0` in `.env` and `docker compose up -d server`. Anything beyond your LAN needs TLS: put a reverse proxy in front of port 8900 and set `PANELARR_BASE_URL=https://…`. Keep the admin ports (8901, 8902) local; reach them through SSH or a VPN if needed.
 
+## Single sign-on (optional)
+
+Users can sign in with your own OpenID Connect provider next to their password. No provider is bundled; it stays off until you set `PANELARR_OIDC_ISSUER`. Every setting is in the server's [configuration docs](https://github.com/panelarr/server/blob/main/docs/configuration.md#single-sign-on-oidc).
+
+1. Panelarr needs its public URL: set `PANELARR_BASE_URL` (see above).
+2. At your provider, register a client (confidential, authorization code flow) with the redirect URI `<PANELARR_BASE_URL>/api/v1/auth/oidc/callback`, e.g. `https://panelarr.example.com/api/v1/auth/oidc/callback`. With `PANELARR_OIDC_LOGOUT=provider`, register `<PANELARR_BASE_URL>/login` as its post-logout redirect URI too.
+3. Put the client secret in `secrets/panelarr_oidc_client_secret.txt` (`chmod 644`, like the other files there, so the server's non-root user can read it) and give it to the server as a Docker secret in a `compose.override.yaml` next to `compose.yaml` (Compose reads it automatically):
+
+   ```yaml
+   services:
+     server:
+       secrets: [panelarr_oidc_client_secret]
+   secrets:
+     panelarr_oidc_client_secret:
+       file: ./secrets/panelarr_oidc_client_secret.txt
+   ```
+
+4. Add the issuer, client ID and `PANELARR_OIDC_CLIENT_SECRET_FILE=/run/secrets/panelarr_oidc_client_secret` to `.env` (the commented example in `.env.example`), then `docker compose up -d server`. The login page shows a "Sign in with SSO" button.
+
+Existing users are never matched by name or email: each one links their login on their account page, and invites can be accepted with single sign-on. Password login keeps working, so an admin can always get in when the provider is down. To make single sign-on the way in for everyone else, link every user first, then set `PANELARR_OIDC_LOCAL_LOGIN=admins`; a user who hasn't linked is locked out (or, with auto-provisioning on, gets a second, empty account). With `PANELARR_OIDC_ADMIN_GROUPS` set, the provider decides who is admin: every single sign-on sets the user's role from those groups, overriding roles set in Panelarr (the last admin is never demoted).
+
 ## Day to day
 
 ```sh
@@ -110,5 +131,6 @@ Back up the volumes `postgres`, `meta`, `mihon-data`, `panelarr-config` and `pan
 | `compose.yaml` | The stack |
 | `generate-secrets.sh` | Creates `.env` and `secrets/` |
 | `.env.example` | Optional settings |
+| `compose.override.yaml` | Your own additions, e.g. the single sign-on secret (not in git) |
 | `meta/meta.yaml` | meta's configuration: the MangaBaka provider, its schedule, the duplicates job |
 | `postgres/10-databases.sh` | Creates the roles and databases on the first start |
